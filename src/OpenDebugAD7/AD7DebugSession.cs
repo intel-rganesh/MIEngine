@@ -131,7 +131,6 @@ namespace OpenDebugAD7
 
             //Register sendInvalidate request
             Protocol.RegisterRequestType<SendInvalidateRequest, SendInvalidateArguments>(r => this.HandleSendInvalidateRequestAsync(r));
-    
         }
 
         private void HandleSendInvalidateRequestAsync(IRequestResponder<SendInvalidateArguments> responder)
@@ -1089,6 +1088,7 @@ namespace OpenDebugAD7
                 SupportsClipboardContext = m_engineConfiguration.ClipboardContext,
                 SupportsLogPoints = true,
                 SupportsReadMemoryRequest = m_engine is IDebugMemoryBytesDAP, // TODO: Read from configuration or query engine for capabilities.
+                SupportsWriteMemoryRequest = true,
                 SupportsModulesRequest = true,
                 AdditionalModuleColumns = additionalModuleColumns,
                 SupportsGotoTargetsRequest = true,
@@ -3145,6 +3145,119 @@ namespace OpenDebugAD7
             catch (Exception e)
             {
                 responder.SetError(new ProtocolException(e.Message));
+            }
+        }
+
+        protected override void HandleWriteMemoryRequestAsync(IRequestResponder<WriteMemoryArguments, WriteMemoryResponse> responder)
+        {
+            WriteMemoryArguments wma = responder.Arguments;
+
+            try
+            {
+                if (string.IsNullOrEmpty(wma.MemoryReference))
+                {
+                    responder.SetError(new ProtocolException("MemoryReference is required."));
+                    return;
+                }
+
+                // Validate memory reference format - must be hexadecimal with 0x prefix
+                ulong baseAddress;
+                if (!wma.MemoryReference.StartsWith("0x") ||
+                    !ulong.TryParse(wma.MemoryReference.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out baseAddress))
+                {
+                    responder.SetError(new ProtocolException("Invalid memory reference format. Expected hexadecimal string like '0x1234ABCD'."));
+                    return;
+                }
+
+                // Get memory context using existing helper method
+                int hr = GetMemoryContext(wma.MemoryReference, wma.Offset ?? 0, out IDebugMemoryContext2 memoryContext, out ulong address);
+                if (hr != HRConstants.S_OK)
+                {
+                    responder.SetError(new ProtocolException($"Failed to create memory context (HRESULT: 0x{hr:X8})"));
+                    return;
+                }
+
+                if (memoryContext == null)
+                {
+                    responder.SetError(new ProtocolException("Created memory context is null"));
+                    return;
+                }
+
+                // Convert base64 data to byte array
+                byte[] data;
+                try
+                {
+                    data = Convert.FromBase64String(wma.Data);
+                }
+                catch (FormatException)
+                {
+                    responder.SetError(new ProtocolException("Invalid base64 data format"));
+                    return;
+                }
+
+                if (data.Length == 0)
+                {
+                    responder.SetError(new ProtocolException("No data to write"));
+                    return;
+                }
+
+                IDebugMemoryBytes2 debugMemoryBytes;
+                hr = m_program.GetMemoryBytes(out debugMemoryBytes);
+                if (hr != HRConstants.S_OK)
+                {
+                    responder.SetError(new ProtocolException($"Failed to access memory interface (HRESULT: 0x{hr:X8})"));
+                    return;
+                }
+
+                if (debugMemoryBytes == null)
+                {
+                    responder.SetError(new ProtocolException("Memory bytes interface is null"));
+                    return;
+                }
+
+                // Perform the actual write operation
+                hr = debugMemoryBytes.WriteAt(memoryContext, (uint)data.Length, data);
+                if (hr != HRConstants.S_OK)
+                {
+                    if (hr == HRConstants.E_NOTIMPL)
+                    {
+                        responder.SetError(new ProtocolException("WriteMemory is not supported by this debug engine"));
+                    }
+                    else
+                    {
+                        responder.SetError(new ProtocolException($"Write operation failed (HRESULT: 0x{hr:X8})"));
+                    }
+                    return;
+                }
+
+                // Notify VS Code of memory change (required for DAP compliance)
+                Protocol.SendEvent(new MemoryEvent
+                {
+                    MemoryReference = wma.MemoryReference,
+                    Offset = wma.Offset ?? 0,
+                    Count = data.Length
+                });
+
+                // Send successful response back to VS Code
+                responder.SetResponse(new WriteMemoryResponse
+                {
+                    BytesWritten = data.Length
+                });
+
+                // Log successful operation for debugging
+                m_logger?.WriteLine(LoggingCategory.AdapterTrace, $"WriteMemory succeeded: wrote {data.Length} bytes to {wma.MemoryReference}");
+            }
+            catch (ArgumentException ex)
+            {
+                // Handle argument-related errors
+                m_logger?.WriteLine(LoggingCategory.DebuggerError, $"WriteMemory argument error: {ex.Message}");
+                responder.SetError(new ProtocolException($"Invalid argument: {ex.Message}"));
+            }
+            catch (Exception ex)
+            {
+                // Handle all other unexpected errors
+                m_logger?.WriteLine(LoggingCategory.DebuggerError, $"WriteMemory failed with unexpected error: {ex}");
+                responder.SetError(new ProtocolException($"Write memory failed: {ex.Message}"));
             }
         }
 
